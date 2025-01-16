@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+
+# For this script to work podman must be run with elevated priviledges or the build process will fail.
+
+if [ "$EUID" -ne 0 ]; then
+    echo "This script must be run as root or with sudo."
+    exit 1
+else
+    echo "Running as root."
+fi
+
+# Debugability
+set -e
+set -x
+
+# Add the docker repository to Apt sources:
+# sudo apt-get update
+#sudo apt-get install -y ca-certificates curl gnupg git
+#sudo install -m 0755 -d /etc/apt/keyrings
+#[ -f /etc/apt/keyrings/docker.gpg ] || curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+#sudo chmod a+r /etc/apt/keyrings/docker.gpg
+#echo \
+#  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+#  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+#  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+## Install docker
+#sudo apt-get update
+#sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+#sudo usermod -aG docker $(id -un)
+
+# Some weirdness in the debian git package?
+#rmdir /home/debian/.gitconfig || true
+#touch /home/debian/.gitconfig
+
+# Fetch build files
+[ -d vyos-build ] || git clone -b current --single-branch https://github.com/vyos/vyos-build
+cd vyos-build
+git pull
+
+# Fix losetup not populating the partitions on the image
+sed -i 's/losetup --show/losetup --partscan --show/' scripts/image-build/raw_image.py
+
+# Add qemu build flavor
+cat << EOF > data/build-flavors/qemu.toml
+build_type = "release"
+image_format = "qcow2"
+packages = [
+    "qemu-guest-agent"
+]
+EOF
+
+# Reuse existing iso if we already built it
+PARAMS=""
+iso="$(ls ./vyos-build/build/*.iso | sort | tail -n1)"
+isofile=$(basename "$iso")
+if [ -n "$iso" ]; then
+    PARAMS+=" --reuse-iso $iso"
+fi
+
+# Build vyos (use sg to run with the newly created docker group)
+export PARAMS
+podman pull vyos/vyos-build:current && \
+podman run --rm -it \
+    -v /dev:/dev \
+    -v "$(pwd)":/vyos \
+    -w /vyos --privileged --sysctl net.ipv6.conf.lo.disable_ipv6=0 \
+    -e GOSU_UID=$(id -u) -e GOSU_GID=$(id -g) \
+    vyos/vyos-build:current \
+    bash -c "set -x; sudo make qemu -- $PARAMS"
+
+qcow2="$(ls vyos-build/build/*.qcow2 | sort | tail -n1)"
+qcow2file=$(basename "$qcow2")
+if [ -n "$qcow2" ]; then
+    mv "$qcow2" "./images/"
+    mv "$iso" "./images/"
+    chown $user:$user "./images/$qcow2file"
+    chown $user:$user "./images/$isofile"
+else
+    echo "The build process was not sucesfull." 
+    echo "No qcow2 image could be found"
+    echo "For details analyse the vyos-build directory."
+    exit 1
+fi
+
+echo
+echo "================================================================"
+echo "Image creation has completed."
+echo "Everything seems to have worked." 
+echo "Be sure to test your new image before using it seriously."
+echo "It is based on a nightly-build so it is not guaranteed bug free."
+echo "================================================================"
+echo "your images are here:"
+echo 
+echo "$(pwd):"
+echo "     - $isofile"
+echo "     - $qcow2file"
+
+# Prompt for confirmation
+read -p "I will now clean-up and delete the source files Is it ok to proceed? (y/n): " confirmation
+
+# Check the response
+if [[ "$confirmation" == "y" || "$confirmation" == "Y" ]]; then
+    echo "Cleaning-up build file structure..."
+    rm -rf ./vyos-build
+else
+    echo "Operation cancelled."
+fi
