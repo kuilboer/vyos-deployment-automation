@@ -1,5 +1,5 @@
 # Ignore Terraform default variables
 *.tfvars
 *.iso
-*.qcow2
+*qemu-amd64.qcow2
 vyos-build/
